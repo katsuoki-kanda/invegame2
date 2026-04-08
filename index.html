@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>Pose Invaders - Wrist Flick Edition</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    
+    <style>
+        body { 
+            margin: 0; 
+            background: #000; 
+            color: #eee; 
+            font-family: 'Helvetica Neue', Arial, sans-serif; 
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            position: relative;
+        }
+
+        canvas { 
+            background: #000; 
+            display: block;
+        }
+
+        #input_video {
+            display: none;
+        }
+
+        #controls {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: 1px solid #00d2ff;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            box-shadow: 0 0 10px rgba(0, 210, 255, 0.3);
+        }
+
+        label {
+            font-size: 16px;
+            color: #00d2ff;
+            font-weight: bold;
+        }
+
+        select {
+            background: #111;
+            color: #eee;
+            border: 1px solid #00d2ff;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 16px;
+            cursor: pointer;
+            outline: none;
+            transition: all 0.3s;
+        }
+
+        select:focus {
+            border-color: #00ff88;
+            box-shadow: 0 0 5px rgba(0, 255, 136, 0.5);
+        }
+
+        select:disabled {
+            background: #333;
+            color: #777;
+            border-color: #555;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="controls">
+        <label for="fireRateSelect">攻撃頻度 (1:低 ～ 4:高):</label>
+        <select id="fireRateSelect">
+            <option value="0.02" selected>1</option>
+            <option value="0.03">2</option>
+            <option value="0.04">3</option>
+            <option value="0.05">4</option>
+        </select>
+    </div>
+
+    <video id="input_video"></video>
+    <canvas id="gameCanvas"></canvas>
+
+<script>
+/**
+ * 1. 基本設定
+ */
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const fireRateSelect = document.getElementById('fireRateSelect');
+
+function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+resizeCanvas();
+
+// 自機の設定
+const playerWidth = 60;
+const playerHeight = 30;
+let playerX = (canvas.width - playerWidth) / 2;
+let playerY = canvas.height - 60; 
+let playerHitTimer = 0; 
+
+// インベーダー設定
+const invaderRows = 4;
+const invaderCols = 10;
+const invaderWidth = 40;
+const invaderHeight = 25;
+const invaderPadding = 20;
+const invaderOffsetTop = 100;
+let invaders = [];
+let invaderDirection = 1;
+let invaderSpeed = 1.2;
+
+// ミサイル設定
+let playerBullets = [];
+let enemyBullets = [];
+const bulletWidth = 4;
+const bulletHeight = 12;
+const pBulletSpeed = 10;
+const eBulletSpeed = 4;
+
+let GLOBAL_ENEMY_FIRE_RATE = 0.02; 
+
+fireRateSelect.addEventListener('change', (e) => {
+    GLOBAL_ENEMY_FIRE_RATE = parseFloat(e.target.value);
+});
+
+// ゲーム状態
+let score = 0;
+let lastScore = 0; 
+let timeLeft = 60;
+let gameRunning = false;
+let message = "カメラ起動中..."; 
+let timerInterval = null;
+let canRestartTime = 0; 
+
+// Pose制御用
+let baseNoseX = null;
+let wasLeftHandRaised = false;
+let wasRightHandRaised = false;
+
+/**
+ * 2. 音声エンジン
+ */
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function playSound(freq, type = 'sine', decay = 0.1, vol = 0.1) {
+    try {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+        gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + decay);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + decay);
+    } catch(e) {}
+}
+
+/**
+ * 3. ゲーム管理
+ */
+function initInvaders() {
+    invaders = [];
+    const totalInvaderWidth = invaderCols * (invaderWidth + invaderPadding) - invaderPadding;
+    const startX = (canvas.width - totalInvaderWidth) / 2;
+
+    for(let r=0; r<invaderRows; r++) {
+        invaders[r] = [];
+        for(let c=0; c<invaderCols; c++) {
+            invaders[r][c] = { 
+                x: startX + c * (invaderWidth + invaderPadding), 
+                y: r * (invaderHeight + invaderPadding) + invaderOffsetTop, 
+                status: 1,
+                color: `hsl(${r * 40 + 140}, 80%, 60%)`
+            };
+        }
+    }
+}
+
+function resetGame() {
+    score = 0;
+    timeLeft = 60;
+    gameRunning = false;
+    playerBullets = [];
+    enemyBullets = [];
+    invaderDirection = 1;
+    invaderSpeed = 1.2;
+    baseNoseX = null;
+    
+    if (fireRateSelect) fireRateSelect.disabled = false;
+
+    if (message !== "カメラ起動中...") {
+        message = "指先を上に向けて（手首を立てて）\nスタート！";
+    }
+    playerY = canvas.height - 60; 
+    initInvaders();
+}
+
+/**
+ * 4. MediaPipe Pose 制御
+ */
+const videoElement = document.getElementById('input_video');
+const pose = new Pose({
+    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+});
+
+pose.setOptions({
+    modelComplexity: 1,
+    smoothLandmarks: true,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+});
+
+pose.onResults(onResults);
+
+const camera = new Camera(videoElement, {
+    onFrame: async () => { await pose.send({image: videoElement}); },
+    width: 640, height: 480
+});
+camera.start();
+
+function onResults(results) {
+    if (message === "カメラ起動中..." && results.poseLandmarks) {
+        message = "両手の指先を上に向けて（手首を立てて）\nスタート！";
+    }
+
+    if (!results.poseLandmarks) return;
+    
+    const landmarks = results.poseLandmarks;
+    const nose = landmarks[0];
+    
+    // 判定に使う部位：手首(Wrist)と人差し指(Index Finger)
+    const leftWrist = landmarks[15];
+    const leftIndex = landmarks[19];
+    const rightWrist = landmarks[16];
+    const rightIndex = landmarks[20];
+
+    // 自機の横移動（鼻の位置を基準）
+    if (baseNoseX === null) baseNoseX = nose.x;
+    const sensitivity = 2.8;
+    let diff = (baseNoseX - nose.x) * sensitivity;
+    let newX = (canvas.width / 2 - playerWidth / 2) + (diff * canvas.width);
+    
+    if (newX < 0) newX = 0;
+    if (newX > canvas.width - playerWidth) newX = canvas.width - playerWidth;
+    playerX = newX;
+
+    // 手首を立てた判定ロジック：------------------------------------------------------------
+    // 指先(Index)のx座標が、手首(Wrist)のx座標より一定以上小さい(上にある)場合に「立てた」とみなす
+    // y座標は上が0、下が1なので、 index.y < wrist.y が「指が手首より上」を意味する
+    const threshold = 0.03; // 判定のしきい値（少しの動きで反応させるなら小さく）
+    const isLeftRaised = (leftWrist.x - leftIndex.x) < threshold && leftWrist.y < 1;
+    const isRightRaised = (rightIndex.x - rightWrist.x) < threshold && rightWrist.y < 1;
+    
+    const now = Date.now();
+
+    // スタート判定
+    if (!gameRunning && (isLeftRaised && isRightRaised) && now > canRestartTime) {
+        startGame();
+    } 
+    
+    // 発射判定（手首をクイッと立てた瞬間に発射）
+    if (gameRunning) {
+        if (isLeftRaised && !wasLeftHandRaised) fireBullet(-15);
+        if (isRightRaised && !wasRightHandRaised) fireBullet(15);
+    }
+
+    wasLeftHandRaised = isLeftRaised;
+    wasRightHandRaised = isRightRaised;
+}
+
+function startGame() {
+    gameRunning = true;
+    if (fireRateSelect) fireRateSelect.disabled = true;
+
+    message = "";
+    playSound(440, 'square', 0.2);
+    if (timerInterval) clearInterval(timerInterval);
+    timerInterval = setInterval(() => {
+        if (gameRunning) {
+            timeLeft--;
+            if (timeLeft <= 0) endGame("TIME UP!");
+        }
+    }, 1000);
+}
+
+function fireBullet(offsetX = 0) {
+    playerBullets.push({
+        x: playerX + playerWidth / 2 - bulletWidth / 2 + offsetX,
+        y: playerY
+    });
+    playSound(880, 'sine', 0.05, 0.03);
+}
+
+function endGame(msg) {
+    gameRunning = false;
+    clearInterval(timerInterval);
+    message = msg;
+    lastScore = score; 
+    canRestartTime = Date.now() + 5000; 
+    playSound(150, 'sawtooth', 0.5);
+    setTimeout(resetGame, 5000);
+}
+
+/**
+ * 5. 描画ロジック
+ */
+function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    drawHUD();
+
+    if (gameRunning) {
+        updateInvaders();
+        updateEnemyFiring();
+        updateBullets();
+    }
+
+    drawInvaders();
+    drawPlayer();
+    drawBullets();
+    drawMessages();
+
+    requestAnimationFrame(draw);
+}
+
+function drawHUD() {
+    ctx.font = "bold 24px Arial";
+    ctx.fillStyle = score < 0 ? "#ff4444" : "#00d2ff";
+    ctx.textAlign = "left";
+    ctx.fillText(`SCORE: ${score}`, 30, 40);
+
+    ctx.fillStyle = "#00ff88";
+    ctx.textAlign = "right";
+    ctx.fillText(`TIME: ${timeLeft}`, canvas.width - 30, 40);
+}
+
+function drawPlayer() {
+    ctx.fillStyle = playerHitTimer > 0 ? "#ff0000" : "#00ff00";
+    if (playerHitTimer > 0) playerHitTimer--;
+
+    ctx.fillRect(playerX, playerY + 10, playerWidth, 20); 
+    ctx.fillRect(playerX + 20, playerY, 20, 10); 
+    
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = ctx.fillStyle;
+    ctx.strokeStyle = "#fff";
+    ctx.strokeRect(playerX, playerY + 10, playerWidth, 20);
+    ctx.shadowBlur = 0;
+}
+
+function drawInvaders() {
+    for(let r=0; r<invaderRows; r++) {
+        for(let c=0; c<invaderCols; c++) {
+            let inv = invaders[r][c];
+            if(inv.status === 1) {
+                ctx.fillStyle = inv.color;
+                ctx.fillRect(inv.x, inv.y, invaderWidth, invaderHeight);
+                ctx.fillStyle = "#000";
+                ctx.fillRect(inv.x + 8, inv.y + 6, 5, 5);
+                ctx.fillRect(inv.x + 27, inv.y + 6, 5, 5);
+            }
+        }
+    }
+}
+
+function drawBullets() {
+    ctx.fillStyle = "#fff";
+    playerBullets.forEach(b => ctx.fillRect(b.x, b.y, bulletWidth, bulletHeight));
+    
+    ctx.fillStyle = "#ff00ff";
+    enemyBullets.forEach(b => ctx.fillRect(b.x, b.y, bulletWidth + 2, bulletHeight));
+}
+
+function updateInvaders() {
+    let hitEdge = false;
+    for(let r=0; r<invaderRows; r++) {
+        for(let c=0; c<invaderCols; c++) {
+            let inv = invaders[r][c];
+            if(inv.status === 1) {
+                inv.x += invaderSpeed * invaderDirection;
+                if(inv.x + invaderWidth > canvas.width - 20 || inv.x < 20) hitEdge = true;
+                if(inv.y + invaderHeight > playerY) endGame("GAME OVER");
+            }
+        }
+    }
+
+    if(hitEdge) {
+        invaderDirection *= -1;
+        invaderSpeed += 0.05;
+        invaders.forEach(row => row.forEach(inv => inv.y += 15));
+    }
+}
+
+function updateEnemyFiring() {
+    if (Math.random() < GLOBAL_ENEMY_FIRE_RATE) {
+        let activeInvaders = [];
+        for(let r=0; r<invaderRows; r++) {
+            for(let c=0; c<invaderCols; c++) {
+                if(invaders[r][c].status === 1) activeInvaders.push(invaders[r][c]);
+            }
+        }
+        if (activeInvaders.length > 0) {
+            let shooter = activeInvaders[Math.floor(Math.random() * activeInvaders.length)];
+            enemyBullets.push({ x: shooter.x + invaderWidth/2, y: shooter.y + invaderHeight });
+        }
+    }
+}
+
+function updateBullets() {
+    for (let i = playerBullets.length - 1; i >= 0; i--) {
+        playerBullets[i].y -= pBulletSpeed;
+        if (playerBullets[i].y < 0) { playerBullets.splice(i, 1); continue; }
+
+        let hit = false;
+        for(let r=0; r<invaderRows; r++){
+            for(let c=0; c<invaderCols; c++){
+                let inv = invaders[r][c];
+                if(inv.status === 1 && playerBullets[i].x > inv.x && playerBullets[i].x < inv.x + invaderWidth &&
+                   playerBullets[i].y > inv.y && playerBullets[i].y < inv.y + invaderHeight) {
+                    inv.status = 0;
+                    hit = true;
+                    score += 10; 
+                    playSound(1200, 'sine', 0.05, 0.03);
+                    break;
+                }
+            }
+            if(hit) break;
+        }
+        if(hit) playerBullets.splice(i, 1);
+    }
+
+    for (let i = enemyBullets.length - 1; i >= 0; i--) {
+        enemyBullets[i].y += eBulletSpeed;
+        if (enemyBullets[i].y > canvas.height) { enemyBullets.splice(i, 1); continue; }
+
+        if (enemyBullets[i].x > playerX && enemyBullets[i].x < playerX + playerWidth &&
+            enemyBullets[i].y > playerY && enemyBullets[i].y < playerY + playerHeight) {
+            
+            enemyBullets.splice(i, 1);
+            score -= 50; 
+            playerHitTimer = 15; 
+            playSound(100, 'sawtooth', 0.3, 0.2);
+        }
+    }
+
+    if(gameRunning && invaders.every(row => row.every(inv => inv.status === 0))) {
+        const timeBonus = timeLeft * 10;
+        score += timeBonus;
+        endGame(`MISSION CLEAR!\nTIME BONUS: +${timeBonus}`);
+    }
+}
+
+function drawMessages() {
+    if (message !== "") {
+        ctx.textAlign = "center";
+        ctx.font = "bold 32px sans-serif";
+        ctx.fillStyle = "#00d2ff"; 
+        
+        const lines = message.split('\n');
+        lines.forEach((line, i) => {
+            ctx.fillText(line, canvas.width / 2, (canvas.height / 2 - 40) + (i * 50));
+        });
+        
+        if (message !== "カメラ起動中...") {
+            ctx.font = "24px sans-serif";
+            ctx.fillStyle = lastScore < 0 ? "#ff4444" : "#ffcc00";
+            ctx.fillText(`最終スコア: ${lastScore}`, canvas.width / 2, canvas.height / 2 + 100);
+            
+            const now = Date.now();
+            if (!gameRunning && now < canRestartTime) {
+                const wait = Math.ceil((canRestartTime - now) / 1000);
+                ctx.font = "20px sans-serif";
+                ctx.fillStyle = "#eee";
+                ctx.fillText(`再開まであと ${wait} 秒`, canvas.width / 2, canvas.height / 2 + 150);
+            }
+        }
+    }
+}
+
+window.addEventListener('resize', () => {
+    resizeCanvas();
+    resetGame();
+});
+
+resetGame();
+draw();
+</script>
+</body>
+</html>
